@@ -1,0 +1,382 @@
+#include <string.h>
+#include "w5100.h"
+
+netcfg_t net;
+
+static uint16_t tx_mask = 0x07FF, rx_mask = 0x07FF;
+static uint16_t local_port = 49152u;
+
+#define TX_BASE 0x4000u
+#define RX_BASE 0x6000u
+
+#define SPIN_LIMIT 20000u
+
+static uint16_t rd16(uint16_t a)
+{
+    uint16_t v = (uint16_t)w5_rd(a) << 8;
+    return v | w5_rd(a + 1);
+}
+
+static void wr16(uint16_t a, uint16_t v)
+{
+    w5_wr(a, (uint8_t)(v >> 8));
+    w5_wr(a + 1, (uint8_t)v);
+}
+
+/* RSR/FSR must be read until two consecutive reads agree */
+static uint16_t rd16s(uint16_t a)
+{
+    uint16_t x = rd16(a), y = rd16(a);
+    while (x != y) { x = y; y = rd16(a); }
+    return y;
+}
+
+static uint8_t sock_cmd(uint8_t cmd)
+{
+    uint16_t n;
+    w5_wr(S0_CR, cmd);
+    for (n = 0; n < SPIN_LIMIT; ++n)
+        if (w5_rd(S0_CR) == 0) return 1;
+    return 0;
+}
+
+/* ---- chip bring-up --------------------------------------------------- */
+
+static uint8_t chip_reset(void)
+{
+    uint16_t n;
+    w5_setmr(0x80);
+    for (n = 0; n < 2000; ++n)
+        if (!(w5_getmr() & 0x80)) break;
+    w5_setmr(0x03);                          /* indirect bus + auto-increment */
+    return rd16(W5_RTR) == 0x07D0;           /* power-on RTR fingerprint */
+}
+
+static uint8_t probe(uint8_t slot)
+{
+    volatile uint8_t *rom = (volatile uint8_t *)(0xC000u + (unsigned)slot * 0x100u);
+
+    /* never poke a Disk II controller: its $Cn01/$Cn03/$Cn05 = $20/$00/$03 */
+    if (rom[1] == 0x20 && rom[3] == 0x00 && rom[5] == 0x03) return 0;
+    w5_setslot(slot);
+    return chip_reset();
+}
+
+static void chip_init(void)
+{
+    uint8_t r;
+
+    w5_wrbuf(W5_SHAR, net.mac, 6);
+    w5_wr(W5_RMSR, 0x03);                    /* socket 0 gets all 8K */
+    w5_wr(W5_TMSR, 0x03);
+    r = w5_rd(W5_RMSR);
+    rx_mask = (uint16_t)((1024u << (r & 3)) - 1);
+    r = w5_rd(W5_TMSR);
+    tx_mask = (uint16_t)((1024u << (r & 3)) - 1);
+    memset(net.ip, 0, 4);
+    w5_wrbuf(W5_GAR, net.ip, 4);
+    w5_wrbuf(W5_SUBR, net.ip, 4);
+    w5_wrbuf(W5_SIPR, net.ip, 4);
+}
+
+void net_apply(void)                         /* push IP settings to the chip */
+{
+    w5_wrbuf(W5_GAR, net.gw, 4);
+    w5_wrbuf(W5_SUBR, net.mask, 4);
+    w5_wrbuf(W5_SIPR, net.ip, 4);
+}
+
+extern uint8_t dhcp_run(net_log_fn log);
+
+uint8_t net_start(net_log_fn log)
+{
+    uint8_t s, found = 0;
+    char msg[32];
+
+    net.up = 0;
+    if (net.mac[0] == 0 && net.mac[1] == 0) {
+        net.mac[0] = 0x02; net.mac[1] = 0x41; net.mac[2] = 0x50;
+        net.mac[3] = 0x32; net.mac[4] = 0x00; net.mac[5] = 0x01;
+    }
+    if (net.slot) {
+        found = probe(net.slot);
+        if (!found) net.slot = 0;
+    }
+    for (s = 1; s < 8 && !found; ++s) {
+        if (probe(s)) { net.slot = s; found = 1; }
+    }
+    if (!found) return NET_NOCARD;
+    strcpy(msg, "Uthernet II found in slot ");
+    msg[26] = (char)('0' + net.slot);
+    msg[27] = 0;
+    log(msg);
+    chip_init();
+    return dhcp_run(log);
+}
+
+/* ---- socket 0 ---------------------------------------------------------- */
+
+void sock_close(void)
+{
+    sock_cmd(0x10);                          /* CLOSE */
+    w5_wr(S0_IR, 0xFF);
+}
+
+static uint8_t sock_open(uint8_t mode, uint16_t port, uint8_t want)
+{
+    uint16_t n;
+    sock_close();
+    w5_wr(S0_MR, mode);
+    wr16(S0_PORT, port);
+    if (!sock_cmd(0x01)) return 0;           /* OPEN */
+    for (n = 0; n < SPIN_LIMIT; ++n)
+        if (w5_rd(S0_SR) == want) return 1;
+    return 0;
+}
+
+uint8_t udp_open(uint16_t port)
+{
+    return sock_open(0x02, port, SR_UDP);
+}
+
+/* copy n bytes into the TX ring (handles wrap) and issue SEND */
+static uint8_t tx_push(const uint8_t *p, uint16_t n)
+{
+    uint16_t wr = rd16(S0_TX_WR);
+    uint16_t off = wr & tx_mask, first = tx_mask + 1 - off;
+
+    if (n <= first) {
+        w5_wrbuf(TX_BASE + off, p, n);
+    } else {
+        w5_wrbuf(TX_BASE + off, p, first);
+        w5_wrbuf(TX_BASE, p + first, n - first);
+    }
+    wr16(S0_TX_WR, wr + n);
+    return sock_cmd(0x20);                   /* SEND */
+}
+
+static uint8_t tx_wait(uint16_t n)
+{
+    uint16_t spin;
+    for (spin = 0; spin < SPIN_LIMIT; ++spin)
+        if (rd16s(S0_TX_FSR) >= n) return 1;
+    return 0;
+}
+
+uint8_t udp_send(const uint8_t *dip, uint16_t dport, const uint8_t *p, uint16_t n)
+{
+    w5_wrbuf(S0_DIPR, dip, 4);
+    wr16(S0_DPORT, dport);
+    if (!tx_wait(n)) return 0;
+    return tx_push(p, n);
+}
+
+/* pull n bytes out of the RX ring at RX_RD, advance, issue RECV */
+static void rx_pull(uint8_t *dst, uint16_t n, uint16_t skip)
+{
+    uint16_t rd = rd16(S0_RX_RD);
+    uint16_t off = rd & rx_mask, first = rx_mask + 1 - off;
+
+    if (dst && n) {
+        if (n <= first) {
+            w5_rdbuf(RX_BASE + off, dst, n);
+        } else {
+            w5_rdbuf(RX_BASE + off, dst, first);
+            w5_rdbuf(RX_BASE, dst + first, n - first);
+        }
+    }
+    wr16(S0_RX_RD, rd + n + skip);
+    sock_cmd(0x40);                          /* RECV */
+}
+
+uint8_t net_last_hdr[8];
+uint16_t net_rx_count;
+
+int16_t udp_recv(uint8_t *p, uint16_t max, uint8_t *srcip)
+{
+    uint8_t hdr[8];
+    uint16_t len, take;
+
+    if (rd16s(S0_RX_RSR) < 8) return 0;
+    /* peek the 8-byte header (src ip, src port, length) at the ring offset */
+    {
+        uint16_t off = rd16(S0_RX_RD) & rx_mask, i;
+        for (i = 0; i < 8; ++i) hdr[i] = w5_rd(RX_BASE + ((off + i) & rx_mask));
+    }
+    memcpy(net_last_hdr, hdr, 8);
+    ++net_rx_count;
+    len = (uint16_t)((hdr[6] << 8) | hdr[7]);
+    if (srcip) memcpy(srcip, hdr, 4);
+    take = len > max ? max : len;
+    /* skip the 8-byte header, read payload, skip any excess */
+    {
+        uint16_t rd = rd16(S0_RX_RD);
+        wr16(S0_RX_RD, rd + 8);
+        rx_pull(p, take, (uint16_t)(len - take));
+    }
+    return (int16_t)take;
+}
+
+/* ---- TCP client ---------------------------------------------------------- */
+
+uint8_t net_tcp_state(void)
+{
+    return w5_rd(S0_SR);
+}
+
+uint8_t net_tcp_connect(const uint8_t *ip, uint16_t port)
+{
+    uint16_t spin;
+    uint8_t sr;
+
+    if (++local_port < 49152u) local_port = 49152u;
+    if (!sock_open(0x01, local_port, SR_INIT)) return NET_TIMEOUT;
+    w5_wrbuf(S0_DIPR, ip, 4);
+    wr16(S0_DPORT, port);
+    if (!sock_cmd(0x04)) return NET_TIMEOUT;     /* CONNECT */
+    for (spin = 0; spin < 60000u; ++spin) {
+        sr = w5_rd(S0_SR);
+        if (sr == SR_ESTABLISHED) return NET_OK;
+        if (sr == SR_CLOSED) return (w5_rd(S0_IR) & 0x08) ? NET_TIMEOUT : NET_REFUSED;
+    }
+    sock_close();
+    return NET_TIMEOUT;
+}
+
+int16_t net_tcp_send(const uint8_t *p, uint16_t n)
+{
+    uint16_t sent = 0, chunk, fsr, spin;
+    uint8_t sr;
+
+    while (sent < n) {
+        sr = w5_rd(S0_SR);
+        if (sr != SR_ESTABLISHED && sr != SR_CLOSE_WAIT) return -1;
+        fsr = 0;
+        for (spin = 0; spin < SPIN_LIMIT && fsr == 0; ++spin) fsr = rd16s(S0_TX_FSR);
+        if (fsr == 0) return -1;
+        chunk = (uint16_t)(n - sent);
+        if (chunk > fsr) chunk = fsr;
+        if (!tx_push(p + sent, chunk)) return -1;
+        sent += chunk;
+    }
+    return (int16_t)sent;
+}
+
+int16_t net_tcp_recv(uint8_t *p, uint16_t max)
+{
+    uint16_t rsr = rd16s(S0_RX_RSR);
+    uint8_t sr;
+
+    if (rsr == 0) {
+        sr = w5_rd(S0_SR);
+        return (sr == SR_ESTABLISHED) ? 0 : -1;
+    }
+    if (rsr > max) rsr = max;
+    rx_pull(p, rsr, 0);
+    return (int16_t)rsr;
+}
+
+void net_tcp_close(void)
+{
+    uint16_t spin;
+    sock_cmd(0x08);                          /* DISCON */
+    for (spin = 0; spin < 5000u; ++spin)
+        if (w5_rd(S0_SR) == SR_CLOSED) break;
+    sock_close();
+}
+
+/* ---- diagnostics ----------------------------------------------------------- */
+
+char *net_hex(char *o, uint16_t v, uint8_t digits)
+{
+    static const char h[] = "0123456789ABCDEF";
+    while (digits--) *o++ = h[(v >> (digits * 4)) & 15];
+    return o;
+}
+
+static char *tag(char *o, const char *t)
+{
+    while (*t) *o++ = *t++;
+    return o;
+}
+
+void net_diag(net_log_fn log)
+{
+    char b[56], *o;
+
+    o = tag(b, "MR=");  o = net_hex(o, w5_getmr(), 2);
+    o = tag(o, " SMR="); o = net_hex(o, w5_rd(S0_MR), 2);
+    o = tag(o, " SR=");  o = net_hex(o, w5_rd(S0_SR), 2);
+    o = tag(o, " IR=");  o = net_hex(o, w5_rd(S0_IR), 2);
+    o = tag(o, " CR=");  o = net_hex(o, w5_rd(S0_CR), 2);
+    *o = 0;
+    log(b);
+    o = tag(b, "FSR="); o = net_hex(o, rd16(S0_TX_FSR), 4);
+    o = tag(o, " TXWR="); o = net_hex(o, rd16(S0_TX_WR), 4);
+    o = tag(o, " RSR="); o = net_hex(o, rd16(S0_RX_RSR), 4);
+    o = tag(o, " RMSR="); o = net_hex(o, w5_rd(W5_RMSR), 2);
+    o = tag(o, " TMSR="); o = net_hex(o, w5_rd(W5_TMSR), 2);
+    *o = 0;
+    log(b);
+    o = tag(b, "PORT="); o = net_hex(o, rd16(S0_PORT), 4);
+    o = tag(o, " DIP="); o = net_hex(o, w5_rd(S0_DIPR), 2);
+    o = net_hex(o, w5_rd(S0_DIPR + 1), 2);
+    o = net_hex(o, w5_rd(S0_DIPR + 2), 2);
+    o = net_hex(o, w5_rd(S0_DIPR + 3), 2);
+    o = tag(o, ":"); o = net_hex(o, rd16(S0_DPORT), 4);
+    o = tag(o, " RXRD="); o = net_hex(o, rd16(S0_RX_RD), 4);
+    *o = 0;
+    log(b);
+}
+
+/* ---- text helpers --------------------------------------------------------- */
+
+const char *net_errstr(uint8_t e)
+{
+    switch (e) {
+    case NET_NOCARD:  return "No Uthernet II found";
+    case NET_NODHCP:  return "No DHCP reply (cable/server?)";
+    case NET_TIMEOUT: return "Connection timed out";
+    case NET_REFUSED: return "Connection refused";
+    case NET_CLOSED:  return "Connection closed";
+    }
+    return "Network error";
+}
+
+void ip_str(const uint8_t *ip, char *out)
+{
+    uint8_t i, n = 0, v, d;
+    for (i = 0; i < 4; ++i) {
+        v = ip[i];
+        d = (uint8_t)(v / 100);
+        if (d) out[n++] = (char)('0' + d);
+        v = (uint8_t)(v % 100);
+        if (d || v >= 10) out[n++] = (char)('0' + v / 10);
+        out[n++] = (char)('0' + v % 10);
+        if (i < 3) out[n++] = '.';
+    }
+    out[n] = 0;
+}
+
+uint8_t ip_parse(const char *s, uint8_t *ip)
+{
+    uint8_t part = 0, digits = 0;
+    uint16_t v = 0;
+
+    for (;; ++s) {
+        if (*s >= '0' && *s <= '9') {
+            v = (uint16_t)(v * 10 + (*s - '0'));
+            if (v > 255 || ++digits > 3) return 0;
+        } else if (*s == '.' || *s == 0) {
+            if (!digits) return 0;
+            ip[part++] = (uint8_t)v;
+            v = 0;
+            digits = 0;
+            if (*s == 0) break;
+            if (part == 4) return 0;
+        } else {
+            return 0;
+        }
+    }
+    return part == 4;
+}

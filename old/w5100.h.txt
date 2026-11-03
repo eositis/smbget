@@ -1,0 +1,87 @@
+/* WIZnet W5100 (Uthernet II) driver: socket 0 only, TCP client + UDP for DHCP */
+#ifndef W5100_H
+#define W5100_H
+
+#include <stdint.h>
+
+/* asm layer (w5100.s) */
+void    __fastcall__ w5_setslot(uint8_t slot);
+void    __fastcall__ w5_setmr(uint8_t v);
+uint8_t w5_getmr(void);
+void    __fastcall__ w5_wr(uint16_t addr, uint8_t val);
+uint8_t __fastcall__ w5_rd(uint16_t addr);
+void    __fastcall__ w5_wrbuf(uint16_t addr, const void *src, uint16_t len);
+void    __fastcall__ w5_rdbuf(uint16_t addr, void *dst, uint16_t len);
+
+/* common registers */
+#define W5_MR     0x0000
+#define W5_GAR    0x0001
+#define W5_SUBR   0x0005
+#define W5_SHAR   0x0009
+#define W5_SIPR   0x000F
+#define W5_RTR    0x0017
+#define W5_RCR    0x0019
+#define W5_RMSR   0x001A
+#define W5_TMSR   0x001B
+
+/* socket 0 registers */
+#define S0        0x0400
+#define S0_MR     (S0 + 0x00)
+#define S0_CR     (S0 + 0x01)
+#define S0_IR     (S0 + 0x02)
+#define S0_SR     (S0 + 0x03)
+#define S0_PORT   (S0 + 0x04)
+#define S0_DIPR   (S0 + 0x0C)
+#define S0_DPORT  (S0 + 0x10)
+#define S0_TX_FSR (S0 + 0x20)
+#define S0_TX_WR  (S0 + 0x24)
+#define S0_RX_RSR (S0 + 0x26)
+#define S0_RX_RD  (S0 + 0x28)
+
+#define SR_CLOSED      0x00
+#define SR_INIT        0x13
+#define SR_SYNSENT     0x15
+#define SR_ESTABLISHED 0x17
+#define SR_CLOSE_WAIT  0x1C
+#define SR_UDP         0x22
+
+#define NET_OK        0
+#define NET_NOCARD    1
+#define NET_NODHCP    2
+#define NET_TIMEOUT   3
+#define NET_REFUSED   4
+#define NET_CLOSED    5
+
+typedef struct {
+    uint8_t slot;                   /* 0 = auto-scan */
+    uint8_t up;                     /* IP configured */
+    uint8_t mac[6];
+    uint8_t ip[4], mask[4], gw[4], dns[4];
+} netcfg_t;
+
+extern netcfg_t net;
+
+typedef void (*net_log_fn)(const char *msg);
+
+uint8_t net_start(net_log_fn log);          /* find card, init chip, DHCP */
+uint8_t net_tcp_connect(const uint8_t *ip, uint16_t port);
+int16_t net_tcp_send(const uint8_t *p, uint16_t n);     /* n sent, or -1 */
+int16_t net_tcp_recv(uint8_t *p, uint16_t max);         /* bytes, 0 = nothing yet, -1 = closed */
+void    net_tcp_close(void);
+uint8_t net_tcp_state(void);
+
+/* helpers for the UDP socket used by DHCP */
+uint8_t udp_open(uint16_t port);
+uint8_t udp_send(const uint8_t *dip, uint16_t dport, const uint8_t *p, uint16_t n);
+int16_t udp_recv(uint8_t *p, uint16_t max, uint8_t *srcip);   /* payload bytes or 0 */
+void    sock_close(void);
+
+char   *net_hex(char *o, uint16_t v, uint8_t digits);
+extern uint8_t net_last_hdr[8];
+extern uint16_t net_rx_count;
+void    net_diag(net_log_fn log);           /* log chip/socket state */
+const char *net_errstr(uint8_t e);
+void    ip_str(const uint8_t *ip, char *out);       /* out >= 16 bytes */
+uint8_t ip_parse(const char *s, uint8_t *ip);       /* 1 if valid dotted quad */
+
+#endif

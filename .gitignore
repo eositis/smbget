@@ -1,0 +1,8 @@
+build/
+*.o
+*.map
+*.lst
+tests/host/build/
+src/build.h
+ext/
+dist/

@@ -1,0 +1,164 @@
+/* Minimal DHCP client (DISCOVER / OFFER / REQUEST / ACK) over the W5100 UDP socket */
+#include <string.h>
+#include "w5100.h"
+
+#define DHCP_PKT 400
+static uint8_t pkt[DHCP_PKT];
+static uint16_t rlen, dbg_n;
+static uint8_t dbg_why, dbg_op, dbg_typ;
+static uint8_t xid[4] = { 0x41, 0x50, 0x32, 0x00 };
+
+#define DHCP_DISCOVER 1
+#define DHCP_OFFER    2
+#define DHCP_REQUEST  3
+#define DHCP_ACK      5
+#define DHCP_NAK      6
+
+extern void net_apply(void);
+
+static uint16_t build(uint8_t type, const uint8_t *reqip, const uint8_t *srvid)
+{
+    uint16_t o;
+
+    memset(pkt, 0, 240);
+    pkt[0] = 1;                       /* BOOTREQUEST */
+    pkt[1] = 1;                       /* Ethernet */
+    pkt[2] = 6;
+    memcpy(pkt + 4, xid, 4);
+    pkt[10] = 0x80;                   /* broadcast flag: reply before we own an IP */
+    memcpy(pkt + 28, net.mac, 6);
+    pkt[236] = 99; pkt[237] = 130; pkt[238] = 83; pkt[239] = 99;   /* magic cookie */
+
+    o = 240;
+    pkt[o++] = 53; pkt[o++] = 1; pkt[o++] = type;
+    pkt[o++] = 61; pkt[o++] = 7; pkt[o++] = 1;
+    memcpy(pkt + o, net.mac, 6); o += 6;
+    pkt[o++] = 12; pkt[o++] = 6;
+    memcpy(pkt + o, "SMBGET", 6); o += 6;
+    if (reqip) {
+        pkt[o++] = 50; pkt[o++] = 4; memcpy(pkt + o, reqip, 4); o += 4;
+        pkt[o++] = 54; pkt[o++] = 4; memcpy(pkt + o, srvid, 4); o += 4;
+    }
+    pkt[o++] = 55; pkt[o++] = 3; pkt[o++] = 1; pkt[o++] = 3; pkt[o++] = 6;
+    pkt[o++] = 255;
+    while (o < 300) pkt[o++] = 0;     /* pad to a normal BOOTP size */
+    return o;
+}
+
+/* find option `code` in a reply; returns pointer to its data or 0 */
+static const uint8_t *opt(uint8_t code, uint8_t *olen)
+{
+    uint16_t i = 240, len = rlen;
+    while (i + 1 < len) {
+        uint8_t c = pkt[i];
+        if (c == 255) break;
+        if (c == 0) { ++i; continue; }
+        if (c == code) { *olen = pkt[i + 1]; return pkt + i + 2; }
+        i = (uint16_t)(i + 2 + pkt[i + 1]);
+    }
+    return 0;
+}
+
+/* wait for a reply of `want` (or NAK); returns message type, 0 on timeout */
+static uint8_t wait_reply(uint8_t want)
+{
+    uint16_t spin;
+    int16_t n;
+    const uint8_t *t;
+    uint8_t l;
+
+    for (spin = 0; spin < 12000u; ++spin) {
+        n = udp_recv(pkt, DHCP_PKT, 0);
+        if (n <= 0) continue;
+        dbg_n = (uint16_t)n;
+        dbg_op = pkt[0];
+        dbg_why = 1;
+        if (n < 241) continue;
+        dbg_why = 2;
+        if (pkt[0] != 2 || memcmp(pkt + 4, xid, 4) != 0) continue;
+        dbg_why = 3;
+        if (memcmp(pkt + 28, net.mac, 6) != 0) continue;
+        rlen = (uint16_t)n;
+        dbg_why = 4;
+        t = opt(53, &l);
+        if (!t) continue;
+        dbg_typ = *t;
+        dbg_why = 5;
+        if (*t == want || *t == DHCP_NAK) return *t;
+    }
+    return 0;
+}
+
+/* why a received datagram was ignored: 1 short, 2 op/xid, 3 chaddr, 4 no opt 53, 5 wrong type */
+static void rx_diag(net_log_fn log)
+{
+    char b[56], *o;
+    uint8_t i;
+
+    o = b;
+    *o++ = 'R'; *o++ = 'X'; *o++ = '#'; o = net_hex(o, net_rx_count, 2);
+    *o++ = ' '; *o++ = 'n'; *o++ = '='; o = net_hex(o, dbg_n, 4);
+    *o++ = ' '; *o++ = 'w'; *o++ = 'h'; *o++ = 'y'; *o++ = '='; o = net_hex(o, dbg_why, 1);
+    *o++ = ' '; *o++ = 'o'; *o++ = 'p'; *o++ = '='; o = net_hex(o, dbg_op, 2);
+    *o++ = ' '; *o++ = 't'; *o++ = 'y'; *o++ = 'p'; *o++ = '='; o = net_hex(o, dbg_typ, 2);
+    *o = 0;
+    log(b);
+    o = b;
+    *o++ = 'H'; *o++ = 'D'; *o++ = 'R'; *o++ = '=';
+    for (i = 0; i < 8; ++i) o = net_hex(o, net_last_hdr[i], 2);
+    *o++ = ' '; *o++ = 'x'; *o++ = 'i'; *o++ = 'd'; *o++ = '=';
+    for (i = 4; i < 8; ++i) o = net_hex(o, pkt[i], 2);
+    *o = 0;
+    log(b);
+}
+
+uint8_t dhcp_run(net_log_fn log)
+{
+    static const uint8_t bcast[4] = { 255, 255, 255, 255 };
+    uint8_t attempt, t, l, offered[4], srv[4];
+    const uint8_t *o;
+    uint16_t n;
+
+    for (attempt = 0; attempt < 4; ++attempt) {
+        ++xid[3];
+        log("DHCP: discover...");
+        if (!udp_open(68)) { log("UDP socket failed"); return NET_NODHCP; }
+        n = build(DHCP_DISCOVER, 0, 0);
+        if (!udp_send(bcast, 67, pkt, n)) {
+            log("DHCP: SEND FAILED");
+            if (attempt == 0) net_diag(log);
+            continue;
+        }
+        if (wait_reply(DHCP_OFFER) != DHCP_OFFER) {
+            log("DHCP: no offer (sent ok)");
+            if (attempt == 0) { net_diag(log); rx_diag(log); }
+            continue;
+        }
+
+        memcpy(offered, pkt + 16, 4);
+        o = opt(54, &l);
+        if (o && l == 4) memcpy(srv, o, 4); else memcpy(srv, bcast, 4);
+        log("DHCP: offer received");
+
+        n = build(DHCP_REQUEST, offered, srv);
+        if (!udp_send(bcast, 67, pkt, n)) continue;
+        t = wait_reply(DHCP_ACK);
+        if (t != DHCP_ACK) { log("DHCP: no ACK, retrying"); continue; }
+
+        memcpy(net.ip, pkt + 16, 4);
+        o = opt(1, &l);
+        if (o && l == 4) memcpy(net.mask, o, 4); else { net.mask[0] = net.mask[1] = net.mask[2] = 255; net.mask[3] = 0; }
+        o = opt(3, &l);
+        if (o && l >= 4) memcpy(net.gw, o, 4); else memset(net.gw, 0, 4);
+        o = opt(6, &l);
+        if (o && l >= 4) memcpy(net.dns, o, 4); else memset(net.dns, 0, 4);
+
+        sock_close();
+        net_apply();
+        net.up = 1;
+        log("DHCP: lease acquired");
+        return NET_OK;
+    }
+    sock_close();
+    return NET_NODHCP;
+}

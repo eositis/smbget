@@ -1,0 +1,131 @@
+; WIZnet W5100 (Uthernet II) low-level I/O in indirect mode.
+;
+; The data port MUST be accessed with plain absolute addressing: indexed
+; stores (STA abs,X / (zp),Y) perform a dummy read, which would trigger an
+; extra auto-increment on the data port. The operands below are patched by
+; w5_setslot to point at $C080 + slot*16 + {4,5,6,7}.
+
+        .include "zeropage.inc"
+        .import popax
+        .export _w5_setslot, _w5_setmr, _w5_getmr
+        .export _w5_wr, _w5_rd, _w5_wrbuf, _w5_rdbuf
+
+        .macro PATCH loc, off
+        lda     sbase
+        clc
+        adc     #off
+        sta     loc+1
+        lda     #$C0
+        sta     loc+2
+        .endmacro
+
+        .data
+sbase:  .byte   $80
+
+        .code
+
+; void __fastcall__ w5_setslot(uint8_t slot)
+_w5_setslot:
+        asl     a
+        asl     a
+        asl     a
+        asl     a
+        clc
+        adc     #$80
+        sta     sbase
+        PATCH   mr_w, 4
+        PATCH   mr_r, 4
+        PATCH   ah_w, 5
+        PATCH   al_w, 6
+        PATCH   dt_w, 7
+        PATCH   ah_r, 5
+        PATCH   al_r, 6
+        PATCH   dt_r, 7
+        PATCH   ah_wb, 5
+        PATCH   al_wb, 6
+        PATCH   dt_wb, 7
+        PATCH   ah_rb, 5
+        PATCH   al_rb, 6
+        PATCH   dt_rb, 7
+        rts
+
+; void __fastcall__ w5_setmr(uint8_t v)
+_w5_setmr:
+mr_w:   sta     $C084
+        rts
+
+; uint8_t w5_getmr(void)
+_w5_getmr:
+mr_r:   lda     $C084
+        ldx     #0
+        rts
+
+; void __fastcall__ w5_wr(uint16_t addr, uint8_t val)
+_w5_wr:
+        sta     tmp1
+        jsr     popax
+ah_w:   stx     $C085
+al_w:   sta     $C086
+        lda     tmp1
+dt_w:   sta     $C087
+        rts
+
+; uint8_t __fastcall__ w5_rd(uint16_t addr)
+_w5_rd:
+ah_r:   stx     $C085
+al_r:   sta     $C086
+dt_r:   lda     $C087
+        ldx     #0
+        rts
+
+; void __fastcall__ w5_wrbuf(uint16_t addr, const void *src, uint16_t len)
+_w5_wrbuf:
+        sta     tmp1
+        stx     tmp2
+        jsr     popax
+        sta     ptr1
+        stx     ptr1+1
+        jsr     popax
+ah_wb:  stx     $C085
+al_wb:  sta     $C086
+        ldy     #0
+wloop:  lda     tmp1
+        ora     tmp2
+        beq     wdone
+        lda     (ptr1),y
+dt_wb:  sta     $C087
+        iny
+        bne     :+
+        inc     ptr1+1
+:       lda     tmp1
+        bne     :+
+        dec     tmp2
+:       dec     tmp1
+        bra     wloop
+wdone:  rts
+
+; void __fastcall__ w5_rdbuf(uint16_t addr, void *dst, uint16_t len)
+_w5_rdbuf:
+        sta     tmp1
+        stx     tmp2
+        jsr     popax
+        sta     ptr1
+        stx     ptr1+1
+        jsr     popax
+ah_rb:  stx     $C085
+al_rb:  sta     $C086
+        ldy     #0
+rloop:  lda     tmp1
+        ora     tmp2
+        beq     rdone
+dt_rb:  lda     $C087
+        sta     (ptr1),y
+        iny
+        bne     :+
+        inc     ptr1+1
+:       lda     tmp1
+        bne     :+
+        dec     tmp2
+:       dec     tmp1
+        bra     rloop
+rdone:  rts
