@@ -1,13 +1,10 @@
 # SMBGET
 
-Norton-Commander-style dual-pane file copier for the Apple II: local ProDOS volumes on the left, an SMB share (via Uthernet II) on the right. Goal: easy file transfer between Apple II systems and modern storage.
+Norton-Commander-style dual-pane file copier for the Apple II: local ProDOS volumes on the left, an SMB share on the right. Goal: easy file transfer between Apple II systems and modern storage.
 
-Target: enhanced //e, //c+ or IIgs with 128K, 80-column text. Built with cc65.
+Target: enhanced //e, //c, //c+ or IIgs with 128K, 80-column text, and a Uthernet II, MegaFlash, or CoGS. Built with cc65.
 
-## Status
-- Done: ProDOS side (volume picker, directory browsing, tag, copy, delete, rename, mkdir). Either pane can show a ProDOS volume, so local-to-local copy works as an engine test. `#TTAAAA` name mapping (type/aux preserved on SMB) with host unit tests.
-- Not yet: Uthernet II (W5100) driver, SMB2 client, setup screen, SMB pane. See the plan for milestones.
-- Not yet run on an emulator or real hardware (only built and linked).
+The user manual is [docs/MANUAL.md](docs/MANUAL.md). It covers setup, guest shares on macOS, Windows, and Synology, and the file-type rules. Problems and requests go to https://github.com/eositis/smbget/issues.
 
 ## Build
     brew install cc65
