@@ -1,0 +1,56 @@
+# SMBGET - Apple IIgs Hardware Validation Log
+
+**Date**: _______________  
+**Tester**: _______________  
+**Build ID**: b___  
+**Apple IIGS config**: RAM ___K, Slot ___ Uthernet II  
+
+## Pre-Flight
+- [ ] 128K aux present
+- [ ] 80-column card functional
+- [ ] Uthernet II in slot ___
+- [ ] Ethernet cable connected, DHCP server reachable
+- [ ] SMB share `______` accessible (guest)
+
+## Test Results
+
+| Test | Step | Expected | Actual | Pass? |
+|------|------|----------|--------|-------|
+| T1.1 | Boot | Title draws | | |
+| T1.2 | Memory | No “needs 128K” | | |
+| T2.1 | Volume picker | Vols shown | | |
+| T3.1 | Network scan | “found in slot X” | | |
+| T3.2 | DHCP | IP assigned | | |
+| T4.1 | SMB connect | “Connected” | | |
+| T5.1 | Download | File copied | | |
+| T6.1 | Upload | `#TTAAAA` name | | |
+| T7.1 | Large file | Progress bar | | |
+| T8.1 | Pane swap | Cursor inverts | | |
+
+## Observations
+
+- Build ID displayed: ________
+- Uthernet II found in slot: ________
+- IP address assigned: ________
+- SMB server: ________
+- Share used: ________
+
+## Errors Encountered
+
+| Time | Message | Cause | Resolution |
+|------|---------|-------|------------|
+|      |         |       |            |
+
+## Final Verdict
+
+- [ ] All critical tests passed
+- [ ] Transfer fidelity verified (type/aux preserved)
+- [ ] Error handling acceptable
+- [ ] Ready for production
+
+**Signature**: _______________  
+**Date**: _______________
+
+---
+
+*Use `make dist` to generate current firmware for flashing.*

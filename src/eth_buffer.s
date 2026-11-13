@@ -1,7 +1,8 @@
 ;
 ; Smaller Ethernet frame buffers than stock ip65 (1518 each).
-; RX: TCP window is patched to 800, so frames are <= 14+20+20+800 = 854.
-; TX: net_tcp_send chunks at 512 bytes -> frames <= 566 (buffer 576); DHCP frame is ~342.
+; RX: frames are <= 854. TX: DHCP frame is ~342, and a volume list of 14
+; entries fits in the 352. The two buffers together also hold a page-aligned
+; 1K ProDOS I/O buffer (see prodos.c). src/ovl/ovl.c assumes eth_outp is 352.
 ;
         .export         eth_inp
         .export         eth_outp
@@ -13,4 +14,4 @@
 eth_inp:
 _eth_inp:       .res    880
 eth_outp:
-_eth_outp:      .res    400
+_eth_outp:      .res    352

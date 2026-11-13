@@ -7,9 +7,14 @@
 static const ovl_api_t *A;
 static uint16_t bas_ll, bas_written;
 
-#define BAS_LINE ((char *)A->outp)           /* text line being assembled (download) */
-#define BAS_IN   (A->outp)                   /* 128-byte read buffer (upload) */
-#define BAS_BODY (A->outp + 128)             /* one tokenized line (upload) */
+/* eth_outp is 352 bytes (src/eth_buffer.s). Download uses the start of it for one
+   text line. Upload keeps a read-ahead chunk and one tokenized line (239 bytes plus
+   the terminating 0) in it at the same time, so the chunk is whatever is left. */
+#define ETH_OUT  352u
+#define BAS_READ (ETH_OUT - (BAS_LINE_MAX + 1))
+#define BAS_LINE ((char *)A->outp)
+#define BAS_IN   (A->outp)
+#define BAS_BODY (A->outp + BAS_READ)
 
 /* ---- download: text -> tokenized program ------------------------------------------ */
 
@@ -64,7 +69,7 @@ static int16_t getb(uint8_t sref)
     if (ipos == ilen) {
         ipos = 0;
         ilen = 0;
-        if (A->pd_read(sref, BAS_IN, 128, &ilen) || !ilen) return -1;
+        if (A->pd_read(sref, BAS_IN, BAS_READ, &ilen) || !ilen) return -1;
     }
     return BAS_IN[ipos++];
 }

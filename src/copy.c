@@ -87,6 +87,11 @@ void copy_set_home(const char *dir)
     strcpy(home, dir);
 }
 
+const char *copy_home(void)
+{
+    return home;
+}
+
 static uint8_t ovl_aborted(void)
 {
     return (uint8_t)(kbhit() && cgetc() == CH_ESC);
@@ -106,7 +111,7 @@ static uint8_t OVL(uint8_t op, uint8_t ref, const uint8_t *p, uint16_t n, uint32
     return ((ovl_entry_fn)OVL_ADDR)(op, &api, ref, p, n, total);
 }
 
-/* Load SMBGET.OVL into $0800 and check its signature. Must run while no ProDOS file is open in slot 0. */
+/* Load SMBGET.OVL and check its signature. Must run while no ProDOS file is open in slot 0. */
 static uint8_t ovl_load(void)
 {
     char path[PD_PATH_MAX + 1];
@@ -135,7 +140,8 @@ static uint8_t ovl_load(void)
     return 0;
 }
 
-uint8_t copy_smb_down(const char *spath, const char *dst, uint8_t type, uint16_t aux, const char *label)
+uint8_t copy_smb_down(const char *spath, const char *dst, uint8_t type, uint16_t aux,
+                      const char *label, uint16_t date)
 {
     uint8_t err, dref = 0, dopen = 0, created = 0, sopen = 0, first = 1, c;
     uint16_t got, n, i;
@@ -201,6 +207,14 @@ uint8_t copy_smb_down(const char *spath, const char *dst, uint8_t type, uint16_t
     if (type == PT_BAS && (err = OVL(OVL_DOWN_END, dref, 0, 0, 0)) != 0) goto fail;
     pd_close(dref);
     smb_close_file();
+    {
+        finfo_t fi;
+        fi.access = 0xC3;
+        fi.type = type;
+        fi.aux = aux;
+        fi.date = date;
+        pd_setinfo(dst, &fi);          /* keep the date the share reported */
+    }
     return 0;
 
 fail:

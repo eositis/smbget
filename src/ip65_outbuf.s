@@ -10,4 +10,4 @@
 
 output_buffer:
 _output_buffer:
-_smbpkt:        .res    800
+_smbpkt:        .res    776

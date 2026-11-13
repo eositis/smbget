@@ -1,4 +1,4 @@
-/* Network layer: IP65 (software stack, W5100 in MACRAW) for DHCP + TCP */
+/* Network layer. Card drivers live in SMBGET.UTH and SMBGET.COG. */
 #ifndef NET_H
 #define NET_H
 
@@ -22,7 +22,8 @@ extern netcfg_t net;
 
 typedef void (*net_log_fn)(const char *msg);
 
-uint8_t net_start(net_log_fn log);          /* find card, DHCP */
+void    net_log(const char *msg);
+uint8_t net_start(net_log_fn log);          /* find card, bring up its driver */
 uint8_t net_tcp_connect(const uint8_t *ip, uint16_t port);
 int16_t net_tcp_send(const uint8_t *p, uint16_t n);     /* n sent, or -1 */
 int16_t net_tcp_recv(uint8_t *p, uint16_t max);         /* bytes, 0 = nothing yet, -1 = closed */

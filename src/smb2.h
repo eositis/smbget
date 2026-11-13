@@ -12,8 +12,12 @@
 #define SMB_E_SESSION 3     /* session setup refused (see smb_status) */
 #define SMB_E_TREE    4     /* tree connect refused (see smb_status) */
 #define SMB_E_PROTO   5     /* malformed or missing reply */
-#define SMB_READ_MAX  700u      /* bytes per read / write request */
-#define SMB_WRITE_MAX 680u
+/* The packet is 776 bytes. A read reply is 4 bytes of NetBIOS length, then
+   DataOffset (0x50) bytes from the SMB2 header, then the data: 684 leaves
+   8 bytes when a server places the data slightly later than 0x50.
+   A write's data starts at packet offset 116, so 660 fills the packet. */
+#define SMB_READ_MAX  684u
+#define SMB_WRITE_MAX 660u
 #define SMB_E_STATUS  6     /* server returned an error (see smb_status) */
 
 extern uint8_t  smb_why;
@@ -31,6 +35,9 @@ uint8_t smb_readdir(const char *path, pd_dir_cb cb);
 uint8_t smb_open_file(const char *path, uint32_t *size);
 void    smb_close_file(void);
 uint8_t smb_create_file(const char *path, uint8_t overwrite);
+uint8_t smb_mkdir(const char *path);
+uint8_t smb_remove(const char *path, uint8_t directory);
+uint8_t smb_rename(const char *path, const char *newpath);
 uint8_t *smb_write_buf(void);
 void    smb_set_normal(void);           /* clear the archive bit of the open file */
 uint8_t smb_write(uint32_t off, uint16_t len);   /* sends the bytes stored at smb_write_buf() */

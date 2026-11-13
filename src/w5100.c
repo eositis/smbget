@@ -70,6 +70,7 @@ static void set_addr(uint16_t addr)
   /* Real W5100 and gssquared need the address latched before data.
    * Reading the address port does not auto-increment. */
   (void)*w5100_addr_lo;
+  w5100_pace();
 }
 
 static uint8_t get_byte(uint16_t addr)

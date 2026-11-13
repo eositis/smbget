@@ -4,8 +4,9 @@
   mkpo.py new IMAGE [--name VOL] [--blocks N]     create an empty volume
   mkpo.py add IMAGE FILE [--name NAME] [--type HEX] [--aux HEX]   add to the root directory
   mkpo.py ls  IMAGE                                list the root directory
-  mkpo.py IMAGE SYSTEMFILE [BOOTREF.po]            new image holding SMBGET.SYSTEM; BOOTREF supplies
-                                                   the standard ProDOS boot blocks 0-1 (optional)
+  mkpo.py IMAGE SYSTEMFILE [BOOTREF]              new image holding SMBGET.SYSTEM. BOOTREF is a
+                                                   140K .po or DOS-order .dsk; its loader (blocks 0-1)
+                                                   and PRODOS file are copied so the image boots.
 
 Files up to 128 KB (seedling/sapling) are supported.
 """
@@ -115,6 +116,28 @@ class Vol:
                 struct.pack_into("<H", h, 4 + 33, c - 1)
                 return
 
+    def read_file(self, name):
+        """Return the bytes of a root-directory file, or None."""
+        name = name.upper()
+        for _, _, e in self.entries():
+            if e[0] >> 4 and bytes(e[1:1 + (e[0] & 15)]).decode() == name:
+                st = e[0] >> 4
+                key = struct.unpack_from("<H", e, 17)[0]
+                eof = int.from_bytes(e[21:24], "little")
+                if st == 1:
+                    return bytes(self.blk(key)[:eof])
+                if st == 2:
+                    idx = bytes(self.blk(key))
+                    out = bytearray()
+                    for i in range(256):
+                        b = idx[i] | (idx[256 + i] << 8)
+                        if not b:
+                            break
+                        out += self.blk(b)
+                    return bytes(out[:eof])
+                raise SystemExit("cannot read %s (storage type %d)" % (name, st))
+        return None
+
     def add(self, name, data, ftype, aux):
         name = name.upper()
         if not (1 <= len(name) <= 15):
@@ -152,6 +175,49 @@ class Vol:
         struct.pack_into("<H", e, 37, 2)
         self.blk(n)[off:off + 39] = e
         self.bump_count()
+
+
+# DOS 3.3 logical sector -> ProDOS block-order sector, within a track.
+DOS_TO_PO = [0, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 15]
+
+
+def is_prodos_volume(img):
+    if len(img) < 3 * BLK:
+        return False
+    hdr = img[2 * BLK + 4]
+    entry_len = img[2 * BLK + 4 + 0x1F]
+    return (hdr & 0xF0) == 0xF0 and entry_len == 0x27
+
+
+def dos_to_po(src):
+    out = bytearray(280 * BLK)
+    for block in range(280):
+        track = block // 8
+        for half in (0, 1):
+            sec = DOS_TO_PO[(block % 8) * 2 + half]
+            src_off = (track * 16 + sec) * 256
+            out[block * BLK + half * 256:block * BLK + half * 256 + 256] = src[src_off:src_off + 256]
+    return out
+
+
+def load_reference(path):
+    """Return a 140K image in ProDOS block order."""
+    src = open(path, "rb").read()
+    if len(src) < 280 * BLK:
+        raise SystemExit("%s is not a 140K disk image" % path)
+    src = src[:280 * BLK]
+    if is_prodos_volume(src):
+        return src
+    converted = dos_to_po(src)
+    if is_prodos_volume(converted):
+        return converted
+    raise SystemExit("%s has no ProDOS volume directory" % path)
+
+
+def real_loader(boot):
+    """AppleCommander writes a splash into block 0 that never loads PRODOS."""
+    plain = bytes(b & 0x7F for b in boot[:2 * BLK])
+    return b"UNABLE TO LOAD PRODOS" in plain
 
 
 def new_volume(name, blocks):
@@ -194,11 +260,22 @@ def main():
     a = sys.argv[1:]
     if len(a) in (2, 3) and not a[0] in ("new", "add", "ls"):  # shortcut: IMAGE SYSTEMFILE [BOOTREF]
         v = new_volume("SMBGET", 280)
-        if len(a) == 3:                    # take the standard ProDOS boot blocks from a reference .po
-            v.d[:1024] = open(a[2], "rb").read()[:1024]
+        note = "copy it onto a disk that already has ProDOS"
+        if len(a) == 3:
+            ref = load_reference(a[2])
+            prodos = Vol(ref).read_file("PRODOS")
+            if real_loader(ref) and prodos:
+                v.d[:2 * BLK] = ref[:2 * BLK]
+                v.add("PRODOS", prodos, 0xFF, 0x2000)
+                note = "boots into the first .SYSTEM file"
+            elif prodos:
+                v.add("PRODOS", prodos, 0xFF, 0x2000)
+                note = "PRODOS copied, but the reference boot block is not a loader"
+            else:
+                note = "reference disk has no PRODOS file"
         v.add("SMBGET.SYSTEM", strip_applesingle(open(a[1], "rb").read()), 0xFF, 0x2000)
         open(a[0], "wb").write(v.d)
-        print("wrote %s (SMBGET.SYSTEM, no ProDOS boot files: copy it to a bootable disk)" % a[0])
+        print("wrote %s (%s)" % (a[0], note))
         return
     ap = argparse.ArgumentParser()
     sp = ap.add_subparsers(dest="cmd", required=True)

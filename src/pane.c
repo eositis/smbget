@@ -133,28 +133,36 @@ void pane_draw_row(const pane_t *p, uint16_t idx, uint8_t active)
     cputc('|');
 }
 
+extern char last_share[];
+
 void pane_draw(const pane_t *p, uint8_t active)
 {
-    uint8_t i, n, w;
-    char title[44];
+    uint8_t i, n, w, keep;
+    const char *lab;
+    char title[40];
 
-    /* top border with title */
+    /* Top border. 38 columns between the corners, so "[ " + label + " " + path + " ]"
+       must fit. A share name is at most 19 characters, which leaves 14 for its path. */
     gotoxy(p->x, ROW_PANE_TOP);
     cputc('+');
-    title[0] = 0;
-    if (p->kind == PK_LOCAL) {
-        strcpy(title, "[ LOCAL ");
-        n = (uint8_t)strlen(p->path);
-        if (n > 26) { strcat(title, "..."); strcat(title, p->path + n - 23); }
-        else strcat(title, p->path);
-        strcat(title, " ]");
-    } else {
-        strcpy(title, "[ SMB ");
-        n = (uint8_t)strlen(p->path);
-        if (n > 26) { strcat(title, "..."); strcat(title, p->path + n - 23); }
-        else strcat(title, p->path);
-        strcat(title, " ]");
+    lab = "LOCAL";
+    keep = 26;
+    if (p->kind != PK_LOCAL) {
+        lab = "SMB";
+        keep = 14;
+        if (last_share[0]) lab = last_share;
     }
+    strcpy(title, "[ ");
+    strcat(title, lab);
+    strcat(title, " ");
+    n = (uint8_t)strlen(p->path);
+    if (n > keep) {
+        strcat(title, "...");
+        strcat(title, p->path + n - (keep - 3));
+    } else {
+        strcat(title, p->path);
+    }
+    strcat(title, " ]");
     if (active) revers(1);
     cputs(title);
     revers(0);
@@ -205,7 +213,7 @@ fentry_t *pane_cur(pane_t *p)
 void pane_tag(pane_t *p)
 {
     fentry_t *f = pane_cur(p);
-    if (!f || (f->flags & (F_UP | F_DIR))) return;
+    if (!f || (f->flags & F_UP)) return;
     f->flags ^= F_TAG;
     if (f->flags & F_TAG) ++p->tagged; else --p->tagged;
     pane_put(p, p->cur, f);
@@ -220,7 +228,7 @@ void pane_tag_all(pane_t *p)
     for (i = 0; i < p->count; ++i) {
         fentry_t f;
         pane_get(p, i, &f);
-        if (f.flags & (F_UP | F_DIR)) continue;
+        if (f.flags & F_UP) continue;
         if (any) f.flags &= (uint8_t)~F_TAG;
         else { f.flags |= F_TAG; ++p->tagged; }
         pane_put(p, i, &f);

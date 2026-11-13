@@ -32,9 +32,10 @@ static char *topstr(char *dst, const char *s)
 extern uint8_t eth_inp[];
 
 /* ---- I/O buffers: two page-aligned 1K buffers ------------------------
-   Slot 0 has its own memory. Slot 1 borrows ip65's Ethernet buffers (eth_inp + eth_outp are
-   contiguous, 1340 bytes), so it may only be used while the network is idle: that is
-   local-to-local copy and directory listing, never an SMB transfer. */
+   Slot 0 has its own memory. Slot 1 borrows the Ethernet buffers (eth_inp and eth_outp
+   are contiguous). The link checks that a page-aligned 1K fits in them. Slot 1 may
+   only be used while the network is idle: local-to-local copy and directory listing,
+   never an SMB transfer. */
 
 #pragma bss-name (push, "IOBUF")
 static uint8_t iobuf0[1024];        /* linked page-aligned (cfg/smbget.cfg) */
@@ -184,7 +185,7 @@ uint8_t pd_setinfo(const char *path, const finfo_t *fi)
     p_info.type = fi->type;
     p_info.aux = fi->aux;
     p_info.blocks = 0;               /* null fields (storage type, blocks) */
-    p_info.mdate = 0;                /* 0 = let ProDOS stamp current date */
+    p_info.mdate = fi->date;         /* 0 = let ProDOS stamp today */
     p_info.mtime = 0;
     return pd_mli(MLI_SETINFO, &p_info);
 }

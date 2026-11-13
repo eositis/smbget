@@ -61,7 +61,7 @@ int main(int argc, char **argv)
         uint32_t size; uint16_t got; uint32_t off = 0, sum = 0; const uint8_t *d;
         r = smb_open_file(argv[4], &size);
         printf("open %s -> %u size %lu status %08X\n", argv[4], r, (unsigned long)size, (unsigned)smb_status);
-        while (!r && (d = smb_read(off, 700, &got)) && got) { for (uint16_t i = 0; i < got; ++i) sum += d[i]; if (off == 0) { printf("first bytes: %.*s\n", got > 40 ? 40 : got, d); } off += got; }
+        while (!r && (d = smb_read(off, SMB_READ_MAX, &got)) && got) { for (uint16_t i = 0; i < got; ++i) sum += d[i]; if (off == 0) { printf("first bytes: %.*s\n", got > 40 ? 40 : got, d); } off += got; }
         printf("read %lu bytes, byte-sum %u\n", (unsigned long)off, (unsigned)sum);
         smb_close_file();
     }

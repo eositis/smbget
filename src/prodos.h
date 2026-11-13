@@ -65,6 +65,9 @@ uint8_t pd_close(uint8_t ref);
 
 const char *pd_errstr(uint8_t err);
 
+/* Disconnect /RAM (slot 3, drive 2) so auxiliary memory is not a volume. */
+void pd_unhook_ram(void);
+
 /* path helpers; path buffers must be PD_PATH_MAX+1 */
 uint8_t pd_path_join(char *path, const char *name);   /* returns 0 if too long */
 void    pd_path_parent(char *path);                   /* strips last component, "" at volume root */

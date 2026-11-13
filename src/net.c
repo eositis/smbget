@@ -1,93 +1,29 @@
 #include <string.h>
-#include <stdbool.h>
-#include <ip65.h>
 #include "net.h"
-#include "w5100.h"
+#include "nic.h"
 
 netcfg_t net;
 
-/* IP65 (software stack, W5100 in MACRAW) is used only for DHCP. Then w5100_config() switches the
-   chip to one hardware TCP socket with 8K buffers, and IP65 is never called again. */
+static net_log_fn logfn;
+
+uint16_t timer_read(void);
+
+void net_log(const char *msg)
+{
+    if (logfn) {
+        logfn(msg);
+    }
+}
 
 uint8_t net_start(net_log_fn log)
 {
-    uint8_t s, found = 0;
-    char msg[32];
-
-    net.up = 0;
-    for (s = net.slot ? net.slot : 1; s < 8; ++s) {
-        if (!ip65_init(s)) { found = s; break; }
-        if (net.slot) break;
-    }
-    if (!found) return NET_NOCARD;
-    net.slot = found;
-    strcpy(msg, "Uthernet II found in slot ");
-    msg[26] = (char)('0' + found);
-    msg[27] = 0;
-    log(msg);
-    memcpy(net.mac, cfg_mac, 6);
-    log("DHCP: discover...");
-    if (dhcp_init()) return NET_NODHCP;
-    memcpy(net.ip, &cfg_ip, 4);
-    memcpy(net.mask, &cfg_netmask, 4);
-    memcpy(net.gw, &cfg_gateway, 4);
-    memcpy(net.dns, &cfg_dns, 4);
-    w5100_init(found);
-    w5100_config();
-    net.up = 1;
-    return NET_OK;
-}
-
-uint8_t net_tcp_connect(const uint8_t *ip, uint16_t port)
-{
-    uint32_t a;
-    memcpy(&a, ip, 4);
-    return w5100_connect_addr(a, port) ? NET_OK : NET_TIMEOUT;
-}
-
-int16_t net_tcp_send(const uint8_t *p, uint16_t n)
-{
-    volatile uint8_t *data = w5100_data;
-    uint16_t left = n, snd, i;
-    uint16_t t0 = timer_read();
-
-    while (left) {
-        snd = w5100_send_request();
-        if (!snd) {
-            if (!w5100_connected() || (uint16_t)(timer_read() - t0) > 8000u) return -1;
-            continue;
-        }
-        if (snd > left) snd = left;
-        for (i = 0; i < snd; ++i) *data = p[i];
-        p += snd;
-        left = (uint16_t)(left - snd);
-        w5100_send_commit(snd);
-        t0 = timer_read();
-    }
-    return (int16_t)n;
-}
-
-int16_t net_tcp_recv(uint8_t *p, uint16_t max)
-{
-    volatile uint8_t *data = w5100_data;
-    uint16_t avail, i;
-
-    avail = w5100_receive_request();
-    if (!avail) return w5100_connected() ? 0 : -1;
-    if (avail > max) avail = max;
-    for (i = 0; i < avail; ++i) p[i] = *data;
-    w5100_receive_commit(avail);
-    return (int16_t)avail;
+    logfn = log;
+    return nic_bringup();
 }
 
 uint16_t net_ms(void)
 {
     return timer_read();
-}
-
-void net_tcp_close(void)
-{
-    w5100_disconnect();
 }
 
 void net_hex(char *out, uint32_t v)
@@ -100,7 +36,7 @@ void net_hex(char *out, uint32_t v)
 const char *net_errstr(uint8_t e)
 {
     switch (e) {
-    case NET_NOCARD:  return "No Uthernet II found";
+    case NET_NOCARD:  return "No network card";
     case NET_NODHCP:  return "No DHCP reply (cable/server?)";
     case NET_TIMEOUT: return "Connection timed out";
     }

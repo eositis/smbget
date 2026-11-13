@@ -9,7 +9,11 @@
 #include "ui.h"
 #include "net.h"
 #include "smb2.h"
+#include "tree.h"
 #include "build.h"
+
+void __fastcall__ lc_move(uint16_t dest, const uint8_t *src, uint16_t n);
+uint8_t lc_ok(void);
 
 #define VERSION "1.0"
 #define MAX_VOLS 14
@@ -27,6 +31,7 @@ static uint8_t nvols;
 /* ---- screen ------------------------------------------------------------- */
 
 static uint8_t server_ip[4];
+char last_share[20];
 static uint8_t log_row;
 
 static void draw_title(void)
@@ -37,12 +42,12 @@ static void draw_title(void)
     gotoxy(0, ROW_TITLE);
     cputs(" SMBGET " VERSION " " BUILD_ID "  ProDOS <-> SMB");
     for (i = 33; i < SCR_W - 1; ++i) cputc(' ');
-    if (net.up) {
-        ip_str(net.ip, ip);
-        cputsxy(50, ROW_TITLE, "Net: ");
+    if (smb_connected()) {
+        ip_str(server_ip, ip);
+        cputsxy(54, ROW_TITLE, "SMB host: ");
         cputs(ip);
     } else {
-        cputsxy(50, ROW_TITLE, "Net: not connected");
+        cputsxy(54, ROW_TITLE, "SMB host: not connected");
     }
     revers(0);
 }
@@ -160,7 +165,6 @@ static void go_up(pane_t *p)
 static void open_cur(pane_t *p)
 {
     fentry_t *f = pane_cur(p);
-    char hn[80];
     if (!f || (p->kind == PK_SMB && !p->loaded)) return;
     if (f->flags & F_UP) { go_up(p); return; }
     if (f->flags & F_DIR) {
@@ -181,135 +185,237 @@ static void open_cur(pane_t *p)
 static uint8_t local_only(void)
 {
     if (ACT->kind != PK_LOCAL || OTH->kind != PK_LOCAL) {
-        ui_alert("SMB", "Not available for SMB yet", 0);
+        ui_alert("SMB", "Not connected", 0);
         return 0;
     }
     return 1;
 }
 
-/* path scratch for do_copy (kept off the small C stack) */
-static char sp[PD_PATH_MAX + 1], dp[PD_PATH_MAX + 1], hn[80];
+/* path scratch (kept off the small C stack; the language-card walk uses it too) */
+char sp[PD_PATH_MAX + 1], dp[PD_PATH_MAX + 1], hn[80];
+uint8_t smb_src, smb_dst;
+static uint8_t cp_all, cp_none;
+uint16_t cp_files, cp_skip;
+char cp_who[PD_NAME_MAX + 1];
+uint16_t tree_ix[TREE_MAX];
+uint8_t tree_sl[TREE_MAX], tree_dl[TREE_MAX];
+uint16_t pick_n, pick_i;
+fentry_t pick_ent;
+uint8_t pick_hit, pick_err, pick_smb;
+
+static uint8_t smb_ready(const pane_t *p)
+{
+    if (p->kind != PK_SMB) return 1;
+    if (p->loaded && smb_connected()) return 1;
+    ui_alert("SMB", "Not connected", 0);
+    return 0;
+}
+
+/* Share root is stored as "/"; the joiner would otherwise make "//name". */
+uint8_t join_share(char *path, const char *name)
+{
+    if (path[0] == '/' && path[1] == 0) path[0] = 0;
+    return pd_path_join(path, name);
+}
+
+static uint8_t paths_for(const pane_t *src, const pane_t *dst, const fentry_t *f)
+{
+    strcpy(sp, src->path);
+    if (smb_src) {
+        pane_hostname(src, f, hn);
+        if (!join_share(sp, hn)) return 0;
+    } else if (!pd_path_join(sp, f->name)) {
+        return 0;
+    }
+    strcpy(dp, dst->path);
+    if (smb_dst) {
+        names_prodos_to_host(f->name, f->type, f->aux, hn);
+        if (!join_share(dp, hn)) return 0;
+    } else if (!pd_path_join(dp, f->name)) {
+        return 0;
+    }
+    return 1;
+}
+
+static uint8_t pick_cb(const fentry_t *f)
+{
+    uint8_t i;
+
+    if (f->flags & F_UP) return 0;
+    if (pick_i != pick_n) { ++pick_i; return 0; }
+    memcpy(&pick_ent, f, sizeof pick_ent);
+    hn[0] = 0;
+    if (pick_smb && dir_hname) {
+        for (i = 0; dir_hname[i] && i < 79; ++i) hn[i] = dir_hname[i];
+        hn[i] = 0;
+    }
+    pick_hit = 1;
+    return 1;
+}
+
+/* The n-th child of the directory in sp. 0 = no more. Does not recurse. */
+uint8_t next_child(void)
+{
+    pick_i = 0;
+    pick_hit = 0;
+    if (pick_smb) pick_err = smb_readdir(sp, pick_cb);
+    else pick_err = pd_readdir(sp, pick_cb);
+    if (pick_err) return 0;
+    return pick_hit;
+}
+
+uint8_t ensure_dir(void)
+{
+    uint8_t err;
+
+    if (smb_dst) {
+        err = smb_mkdir(dp);
+        if (!err) return 0;
+        if (smb_status == 0xC0000035UL) return 0;
+        return CP_SMB;
+    }
+    err = pd_mkdir(dp);
+    if (err == PD_ERR_DUP) return 0;
+    return err;
+}
+
+uint8_t copy_file_paths(const char *label, uint8_t type, uint16_t aux, uint16_t date)
+{
+    uint8_t err;
+    finfo_t fi;
+    char c;
+
+    if (smb_dst) {
+        err = copy_smb_up(sp, dp, label, 0);
+        if (err != CP_EXISTS) return err;
+        if (cp_none) return CP_EXISTS;
+        if (cp_all) c = 'A';
+        else c = ui_overwrite(label);
+        if (c == 'C') return CP_ABORT;
+        if (c == 'S' || c == 'N') {
+            if (c == 'N') cp_none = 1;
+            return CP_EXISTS;
+        }
+        if (c == 'A') cp_all = 1;
+        return copy_smb_up(sp, dp, label, 1);
+    }
+    if (!pd_getinfo(dp, &fi)) {
+        if (cp_none) return CP_EXISTS;
+        if (!cp_all) {
+            c = ui_overwrite(label);
+            if (c == 'C') return CP_ABORT;
+            if (c == 'S' || c == 'N') {
+                if (c == 'N') cp_none = 1;
+                return CP_EXISTS;
+            }
+            if (c == 'A') cp_all = 1;
+        }
+        pd_destroy(dp);
+    }
+    if (smb_src) return copy_smb_down(sp, dp, type, aux, label, date);
+    return copy_local_file(sp, dp, label);
+}
+
+static void copy_failed(uint8_t err, const char *who)
+{
+    const char *why;
+
+    if (err == CP_ABORT) { ui_msg("Copy aborted"); return; }
+    if (err >= CP_LONG) { ui_msg("Path too long"); return; }
+    if (err == CP_SMB) why = smb_errstr(SMB_E_STATUS);
+    else if (err == CP_BAS) why = "Need SMBGET.OVL";
+    else why = pd_errstr(err);
+    ui_alert("Copy failed", who, why);
+}
 
 static void do_copy(void)
 {
     pane_t *src = ACT, *dst = OTH;
-    uint16_t i, copied = 0, skipped = 0, dirs = 0;
-    finfo_t fi;
-    uint8_t err, all = 0, none = 0, single = (uint8_t)(src->tagged == 0), smbdown, smbup;
-    char c;
+    uint16_t i;
+    uint8_t err, single, smbdown, smbup;
+    char n[12];
 
     smbdown = (uint8_t)(src->kind == PK_SMB && dst->kind == PK_LOCAL && src->loaded);
     smbup = (uint8_t)(src->kind == PK_LOCAL && dst->kind == PK_SMB && dst->loaded);
+    smb_src = smbdown;
+    smb_dst = smbup;
     if (!smbdown && !smbup && !local_only()) return;
     if (!smbdown && !smbup && strcmp(src->path, dst->path) == 0) {
         ui_alert("Copy", "Source and target are the same folder.", 0);
         return;
     }
+    cp_all = cp_none = 0;
+    cp_files = cp_skip = 0;
+    single = (uint8_t)(src->tagged == 0);
     for (i = 0; i < src->count; ++i) {
-        fentry_t fe, *f = &fe;
-        pane_get(src, i, f);
+        pane_get(src, i, &pick_ent);
+        if (pick_ent.flags & F_UP) continue;
         if (single) {
             if (i != src->cur) continue;
-        } else if (!(f->flags & F_TAG)) {
+        } else if (!(pick_ent.flags & F_TAG)) {
             continue;
         }
-        if (f->flags & F_UP) continue;
-        if (f->flags & F_DIR) { ++dirs; continue; }
-
-        strcpy(sp, src->path);
-        if (smbdown) {
-            pane_hostname(src, f, hn);
-            if (!sp[1]) sp[0] = 0;
-            pd_path_join(sp, hn);
-        } else {
-            pd_path_join(sp, f->name);
+        memcpy(cp_who, pick_ent.name, PD_NAME_MAX);
+        cp_who[PD_NAME_MAX] = 0;
+        if (!paths_for(src, dst, &pick_ent)) { copy_failed(CP_LONG, cp_who); break; }
+        if (pick_ent.flags & F_DIR) err = copy_tree();
+        else {
+            err = copy_file_paths(pick_ent.name, pick_ent.type, pick_ent.aux, pick_ent.date);
+            if (!err) ++cp_files;
         }
-        strcpy(dp, dst->path);
-        if (smbup) {
-            names_prodos_to_host(f->name, f->type, f->aux, hn);
-            if (!dp[1]) dp[0] = 0;
-            pd_path_join(dp, hn);
-            err = copy_smb_up(sp, dp, f->name, 0);
-            if (err == CP_EXISTS && !none) {
-                c = all ? 'A' : ui_overwrite(f->name);
-                if (c == 'C') break;
-                if (c == 'S') { ++skipped; continue; }
-                if (c == 'N') { none = 1; ++skipped; continue; }
-                if (c == 'A') all = 1;
-                err = copy_smb_up(sp, dp, f->name, 1);
-            } else if (err == CP_EXISTS) {
-                ++skipped; continue;
-            }
-            goto done_one;
-        }
-        pd_path_join(dp, f->name);
-
-        if (!pd_getinfo(dp, &fi)) {               /* target exists */
-            if (none) { ++skipped; continue; }
-            if (!all) {
-                c = ui_overwrite(f->name);
-                if (c == 'C') break;
-                if (c == 'S') { ++skipped; continue; }
-                if (c == 'N') { none = 1; ++skipped; continue; }
-                if (c == 'A') all = 1;
-            }
-            pd_destroy(dp);
-        }
-        err = smbdown ? copy_smb_down(sp, dp, f->type, f->aux, f->name) : copy_local_file(sp, dp, f->name);
-done_one:
-        if (err == CP_ABORT) { ui_msg("Copy aborted"); break; }
-        if (err) {
-            ui_alert("Copy failed", f->name, err == CP_SMB ? smb_errstr(SMB_E_STATUS) : err == CP_BAS ? (const char *)"BASIC conversion failed (SMBGET.OVL?)" : pd_errstr(err));
-            break;
-        }
-        ++copied;
+        if (err == CP_EXISTS) { ++cp_skip; continue; }
+        if (err) { copy_failed(err, cp_who); break; }
     }
     reload_both();
     draw_all();
-    {
-        char n[12];
-        fmt_num(n, copied, 1);
-        ui_msg2("Files copied: ", n);
-        if (skipped || dirs) {
-            cputs(skipped ? "  (skipped existing)" : "");
-            if (dirs) cputs("  (folders not copied yet)");
-        }
+    fmt_num(n, cp_files, 1);
+    ui_msg2("Files copied: ", n);
+    if (cp_skip) cputs("  (skipped existing)");
+}
+
+static uint8_t item_path(const pane_t *p, const fentry_t *f)
+{
+    if (p->kind == PK_SMB) {
+        pane_hostname(p, f, hn);
+        strcpy(sp, p->path);
+        return join_share(sp, hn);
     }
+    strcpy(sp, p->path);
+    return pd_path_join(sp, f->name);
 }
 
 static void do_delete(void)
 {
     pane_t *p = ACT;
-    uint16_t i, n = 0, last = 0;
-    char path[PD_PATH_MAX + 1], num[12];
-    uint8_t single = (uint8_t)(p->tagged == 0), err;
-    fentry_t fe, *f;
+    uint16_t i;
+    uint8_t single, err, share;
 
-    if (p->kind != PK_LOCAL) { local_only(); return; }
-    for (i = 0; i < p->count; ++i) {
-        f = &fe;
-        pane_get(p, i, f);
-        if (f->flags & F_UP) continue;
-        if (single ? (i == p->cur) : (f->flags & F_TAG)) { ++n; last = i; }
-    }
-    if (n == 0) return;
-    if (n == 1) {
-        pane_get(p, last, &fe);
-        if (!ui_confirm("Delete", fe.name, "Delete this item?")) { draw_all(); return; }
-    } else {
-        fmt_num(num, n, 1);
-        strcat(num, " tagged files");
-        if (!ui_confirm("Delete", num, "Delete all of them?")) { draw_all(); return; }
+    if (!smb_ready(p)) return;
+    share = (uint8_t)(p->kind == PK_SMB);
+    single = (uint8_t)(p->tagged == 0);
+    if (single) {
+        pane_get(p, p->cur, &pick_ent);
+        if (pick_ent.flags & F_UP) return;
+        if (!ui_confirm("Delete", pick_ent.name, "Delete this item?")) { draw_all(); return; }
+    } else if (!ui_confirm("Delete", "Delete every tagged item?", 0)) {
+        draw_all();
+        return;
     }
     for (i = 0; i < p->count; ++i) {
-        f = &fe;
-        pane_get(p, i, f);
-        if (f->flags & F_UP) continue;
-        if (!(single ? (i == p->cur) : (f->flags & F_TAG))) continue;
-        strcpy(path, p->path);
-        pd_path_join(path, f->name);
-        err = pd_destroy(path);
-        if (err) { ui_alert("Delete failed", f->name, pd_errstr(err)); break; }
+        pane_get(p, i, &pick_ent);
+        if (pick_ent.flags & F_UP) continue;
+        if (single) {
+            if (i != p->cur) continue;
+        } else if (!(pick_ent.flags & F_TAG)) {
+            continue;
+        }
+        if (!item_path(p, &pick_ent)) { ui_msg("Path too long"); break; }
+        if (share) err = smb_remove(sp, (uint8_t)((pick_ent.flags & F_DIR) != 0));
+        else err = pd_destroy(sp);
+        if (!err) continue;
+        if (share) ui_alert("Delete failed", pick_ent.name, smb_errstr(err));
+        else ui_alert("Delete failed", pick_ent.name, pd_errstr(err));
+        break;
     }
     reload_both();
     draw_all();
@@ -319,17 +425,27 @@ static void do_rename(void)
 {
     pane_t *p = ACT;
     fentry_t *f = pane_cur(p);
-    char name[PD_NAME_MAX + 1], from[PD_PATH_MAX + 1], to[PD_PATH_MAX + 1];
-    uint8_t err;
+    uint8_t err, share;
 
-    if (p->kind != PK_LOCAL) { local_only(); return; }
-    if (!f || (f->flags & F_UP)) return;
-    strcpy(name, f->name);
-    if (!ui_input("Rename", "New name:", name, PD_NAME_MAX)) { draw_all(); return; }
-    strcpy(from, p->path); pd_path_join(from, f->name);
-    strcpy(to, p->path);   pd_path_join(to, name);
-    err = pd_rename(from, to);
-    if (err) ui_alert("Rename failed", pd_errstr(err), 0);
+    if (!f || (f->flags & F_UP) || !smb_ready(p)) return;
+    share = (uint8_t)(p->kind == PK_SMB);
+    if (share) {
+        if (!item_path(p, f)) { ui_msg("Path too long"); draw_all(); return; }
+        if (!ui_input("Rename", "New name:", hn, 40) || !hn[0]) { draw_all(); return; }
+        strcpy(dp, p->path);
+        if (!join_share(dp, hn)) { ui_msg("Path too long"); draw_all(); return; }
+        err = smb_rename(sp, dp);
+        if (err) ui_alert("Rename failed", smb_errstr(err), 0);
+    } else {
+        strcpy(hn, f->name);
+        if (!ui_input("Rename", "New name:", hn, PD_NAME_MAX) || !hn[0]) { draw_all(); return; }
+        strcpy(sp, p->path);
+        pd_path_join(sp, f->name);
+        strcpy(dp, p->path);
+        pd_path_join(dp, hn);
+        err = pd_rename(sp, dp);
+        if (err) ui_alert("Rename failed", pd_errstr(err), 0);
+    }
     reload_both();
     draw_all();
 }
@@ -337,25 +453,36 @@ static void do_rename(void)
 static void do_mkdir(void)
 {
     pane_t *p = ACT;
-    char name[PD_NAME_MAX + 1], path[PD_PATH_MAX + 1];
-    uint8_t err;
+    uint8_t err, share;
 
-    if (p->kind != PK_LOCAL) { local_only(); return; }
-    name[0] = 0;
-    if (!ui_input("Make directory", "Name:", name, PD_NAME_MAX) || !name[0]) { draw_all(); return; }
-    strcpy(path, p->path);
-    pd_path_join(path, name);
-    err = pd_mkdir(path);
-    if (err) ui_alert("MkDir failed", pd_errstr(err), 0);
+    if (!smb_ready(p)) return;
+    share = (uint8_t)(p->kind == PK_SMB);
+    hn[0] = 0;
+    {
+        uint8_t maxlen = PD_NAME_MAX;
+        if (share) maxlen = 40;
+        if (!ui_input("Make directory", "Name:", hn, maxlen) || !hn[0]) {
+            draw_all();
+            return;
+        }
+    }
+    strcpy(sp, p->path);
+    if (share) {
+        if (!join_share(sp, hn)) { ui_msg("Path too long"); draw_all(); return; }
+        err = smb_mkdir(sp);
+        if (err) ui_alert("MkDir failed", smb_errstr(err), 0);
+    } else {
+        if (!pd_path_join(sp, hn)) { ui_msg("Path too long"); draw_all(); return; }
+        err = pd_mkdir(sp);
+        if (err) ui_alert("MkDir failed", pd_errstr(err), 0);
+    }
     reload_both();
     draw_all();
 }
 
 /* ---- network self-test ---------------------------------------------------- */
 
-static char last_share[20];
-
-static void net_log(const char *m)
+static void nlog(const char *m)
 {
     if (log_row > 17) {
         cclearxy(13, 7, 54);
@@ -375,11 +502,11 @@ static void do_network(void)
     ui_box(10, 4, 60, 16, "Network test");
     log_row = 6;
     if (!net.up) {
-        net_log("Scanning for Uthernet II...");
-        err = net_start(net_log);
+        nlog("Looking for a network card...");
+        err = net_start(nlog);
         if (err) {
-            net_log(net_errstr(err));
-            net_log("Press any key");
+            nlog(net_errstr(err));
+            nlog("Press any key");
             cgetc();
             draw_all();
             return;
@@ -398,23 +525,23 @@ static void do_network(void)
             draw_all();
             ui_box(10, 4, 60, 16, "SMB connect");
             log_row = 6;
-            err = smb_connect(server_ip, share, net_log);
+            err = smb_connect(server_ip, share, nlog);
             if (err) {
                 char st[9];
                 strcpy(m, smb_errstr(err));
                 net_hex(st, smb_status);
-                net_log(m);
-                net_log("NT status:");
+                nlog(m);
+                nlog("NT status:");
                 cputs(st);
             } else {
-                net_log("Connected to share (guest).");
-                net_log("Reading directory...");
+                nlog("Connected to share (guest).");
+                nlog("Reading directory...");
                 strcpy(panes[1].path, "/");
                 panes[1].kind = PK_SMB;
-                if (pane_load(&panes[1])) { net_log("Directory read failed"); err = 1; }
+                if (pane_load(&panes[1])) { nlog("Directory read failed"); err = 1; }
             }
             if (err) {
-                net_log("Press any key");
+                nlog("Press any key");
                 cgetc();
             }
         }
@@ -459,11 +586,41 @@ static void init_panes(void)
     if (panes[0].path[0]) pane_load(&panes[0]);
 }
 
+/* SMBGET.NAM holds the name tables; they run from language-card bank 2. */
+static uint8_t load_names(void)
+{
+    extern uint8_t smbpkt[];
+    uint8_t err, ref = 0;
+    uint16_t got, dest = 0xD400;
+
+    if (!copy_home()[0]) return 1;
+    strcpy(sp, copy_home());
+    if (!pd_path_join(sp, "SMBGET.NAM")) return 1;
+    err = pd_open(sp, 0, &ref);
+    if (err) return err;
+    for (;;) {
+        err = pd_read(ref, smbpkt, 128, &got);
+        if (got) {
+            if (got > (uint16_t)(0xE000 - dest)) { err = 1; break; }
+            lc_move(dest, smbpkt, got);
+            dest = (uint16_t)(dest + got);
+        }
+        if (err == PD_ERR_EOF) { err = 0; break; }
+        if (err || !got) break;
+    }
+    pd_close(ref);
+    if (err) return err;
+    if (!lc_ok()) return 1;
+    return 0;
+}
+
 void main(void)
 {
     char c;
     pane_t *p;
+    uint8_t err;
 
+    pd_unhook_ram();
     if (!aux_present()) {
         cputs("SMBGET needs a 128K Apple IIe/IIc (aux memory).\r\n");
         cgetc();
@@ -471,6 +628,12 @@ void main(void)
     }
     ui_init();
     init_panes();
+    err = load_names();
+    if (err) {
+        if (err == 1) ui_alert("SMBGET.NAM", "Put it next to SMBGET.SYSTEM.", 0);
+        else ui_alert("SMBGET.NAM", pd_errstr(err), 0);
+        return;
+    }
     active = 0;
     draw_all();
     if (!panes[0].path[0]) pick_volume(&panes[0]), draw_all();

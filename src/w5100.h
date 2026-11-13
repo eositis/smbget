@@ -46,6 +46,9 @@ void w5100_data_commit(bool do_send, uint16_t size);
 // to be sent to the server.
 extern volatile uint8_t* w5100_data;
 
+/* IIc Plus, 4 MHz: let MegaFlash publish the next W5100 data byte. */
+void w5100_pace(void);
+
 // Initialize this module after the IP65 TCP/IP stack has been initialized.
 // Return true if the (virtual) W5100 supports DNS Offloading.
 // https://github.com/a2retrosystems/uthernet2/wiki/Virtual-W5100-with-DNS

@@ -2,7 +2,7 @@
 #include "smb2.h"
 #include "names.h"
 
-#define PKT_MAX 800u
+#define PKT_MAX 776u
 #define H       4u                 /* SMB2 header offset (after 4-byte length) */
 
 const char *dir_hname;
@@ -313,7 +313,7 @@ uint8_t smb_readdir(const char *path, pd_dir_cb cb)
         memcpy(pkt + b + 8, fileid, 16);
         put16(b + 24, 96);
         put16(b + 26, 2);
-        put32(b + 28, 700);               /* output buffer: 4+64+8+700 fits the 800-byte packet */
+        put32(b + 28, 700);               /* output buffer: 4+64+8+700 fits the 776-byte packet */
         pkt[b + 32] = '*';
         first = 0;
         r = send_msg(34);
@@ -369,7 +369,7 @@ uint8_t *smb_scratch(uint16_t *size)
 
 /* ---- file read ----------------------------------------------------------- */
 
-#define READ_MAX 700u
+#define READ_MAX SMB_READ_MAX
 
 uint8_t smb_open_file(const char *path, uint32_t *size)
 {
@@ -410,7 +410,7 @@ const uint8_t *smb_read(uint32_t off, uint16_t want, uint16_t *got)
 
 /* ---- file create / write ------------------------------------------------- */
 
-#define WRITE_MAX 680u
+#define WRITE_MAX SMB_WRITE_MAX
 #define WRITE_DATA (H + 64 + 48)       /* offset of the data area inside pkt */
 
 /* Create (overwrite=0: fail if it exists -> SMB_E_STATUS with smb_status C0000035). */
@@ -458,6 +458,68 @@ void smb_set_normal(void)
     memcpy(pkt + b + 16, fileid, 16);
     put32(b + 32 + 32, 0x80);               /* FileAttributes = NORMAL; the four times stay 0 = unchanged */
     if (!send_msg(72)) recv_msg();
+}
+
+/* Create a directory. An existing one comes back as SMB_E_STATUS / 0xC0000035. */
+uint8_t smb_mkdir(const char *path)
+{
+    uint8_t r;
+
+    if (!up) return SMB_E_TCP;
+    r = obj_open(path, 0x00100081UL, 0x00000001UL, 2, 0);   /* create, directory */
+    if (r) return r;
+    dir_close();
+    return SMB_OK;
+}
+
+/* Delete a file or an empty directory (FILE_DELETE_ON_CLOSE, then close). */
+uint8_t smb_remove(const char *path, uint8_t directory)
+{
+    uint8_t r;
+    uint32_t opt = 0x00001000UL;
+
+    if (!up) return SMB_E_TCP;
+    if (directory) opt |= 0x00000001UL;
+    else opt |= 0x00000040UL;
+    r = obj_open(path, 0x00110080UL, opt, 1, 0);            /* delete access, open */
+    if (r) return r;
+    dir_close();
+    return SMB_OK;
+}
+
+/* Rename. newpath is a share path; the server wants it from the share root. */
+uint8_t smb_rename(const char *path, const char *newpath)
+{
+    uint8_t r;
+    uint16_t b, name, end;
+
+    if (!up) return SMB_E_TCP;
+    r = obj_open(path, 0x00110080UL, 0, 1, 0);
+    if (r) return r;
+    b = H + 64;
+    hdr(0x0011);
+    memset(pkt + b, 0, 52);                 /* SET_INFO header + rename header */
+    put16(b, 33);
+    pkt[b + 2] = 1;                         /* file information */
+    pkt[b + 3] = 10;                        /* FileRenameInformation */
+    put32(b + 4, 20);                       /* replaced once the name length is known */
+    put16(b + 8, 96);                       /* buffer offset from the SMB2 header */
+    memcpy(pkt + b + 16, fileid, 16);
+    name = (uint16_t)(b + 52);              /* UTF-16 name, after the 20-byte rename header */
+    pkt[name] = '\\';
+    pkt[name + 1] = 0;
+    end = put_path((uint16_t)(name + 2), newpath);
+    if (end > PKT_MAX) {
+        dir_close();
+        return SMB_E_PROTO;
+    }
+    put32((uint16_t)(b + 48), (uint32_t)(end - name));          /* FileNameLength */
+    put32(b + 4, (uint32_t)(end - (b + 32)));                   /* BufferLength */
+    r = send_msg((uint16_t)(end - b));
+    if (!r) r = recv_msg();
+    if (!r && smb_status) r = SMB_E_STATUS;
+    dir_close();
+    return r;
 }
 
 /* ---- public -------------------------------------------------------------- */
